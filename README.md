@@ -50,12 +50,15 @@ Each script is configured by command-line flags. The toxicity branch (`perspecti
 pip install -r requirements.txt
 ```
 
-Download the dataset from Hugging Face. Either grab a single dimension or the whole repo:
+`lvlm_gen.py` can read the dataset in two ways:
 
-```bash
-hf download thoughtworks/CulturalCounterfactuals \
-    --repo-type dataset --local-dir cultural_counterfactuals_dataset
-```
+1. **Directly from Hugging Face** (no local download). Pass `--hf_dataset thoughtworks/CulturalCounterfactuals --hf_config <dimension>`; the script will stream the Parquet shards through the `datasets` library. This requires `pip install datasets`.
+2. **From a local copy**. Download the dataset once and point `--ctf_dir` / `--metadata` at it:
+
+   ```bash
+   hf download thoughtworks/CulturalCounterfactuals \
+       --repo-type dataset --local-dir cultural_counterfactuals_dataset
+   ```
 
 You will need:
 - A GPU and the appropriate model weights (`lvlm_gen.py` downloads from the Hugging Face Hub on first use). One GPU per `lvlm_gen.py` worker is recommended.
@@ -65,7 +68,27 @@ You will need:
 
 `lvlm_gen.py` iterates over the counterfactual sets in one dimension (`religion`, `nationality`, or `socioeconomic`), prompts a chosen LVLM with one or more questions, and appends each response to a JSONL file. Each row of the JSONL contains `{model, img_file_path, args, prompt, text}`.
 
-Example — Qwen2.5-VL on the religion dimension, sampling 3 responses per (image, prompt):
+### Loading from the Hugging Face dataset (recommended)
+
+Pass `--hf_dataset` and `--hf_config` to stream images straight from the published Parquet shards — no local download required:
+
+```bash
+python lvlm_gen.py \
+    --hf_dataset thoughtworks/CulturalCounterfactuals \
+    --hf_config religion \
+    --out_dir output_lvlm_gen \
+    --model Qwen/Qwen2.5-VL-7B-Instruct \
+    --batch_size 8 \
+    --num_responses 3 \
+    --prompts arrest,bad_influence,good_influence,should,shouldnt,keywords_v2 \
+    --max_new_tokens 512
+```
+
+When `--hf_dataset` is set, `--ctf_dir` and `--metadata` are ignored. `--hf_config` must be one of `religion`, `nationality`, or `socioeconomic`; `--hf_split` defaults to `train`. Note that `--people_only` is not supported in this mode (the source person images are not part of the published dataset) — use local mode if you need that baseline.
+
+### Loading from a local download
+
+Alternatively, point the script at the locally downloaded dataset:
 
 ```bash
 python lvlm_gen.py \
@@ -102,8 +125,8 @@ Use `--n_partitions` and `--partition` to split the work across machines or GPUs
 ```bash
 for p in 0 1 2 3; do
     CUDA_VISIBLE_DEVICES=$p python lvlm_gen.py \
-        --ctf_dir cultural_counterfactuals_dataset/religion \
-        --metadata cultural_counterfactuals_dataset/metadata/religion-post-filter.json \
+        --hf_dataset thoughtworks/CulturalCounterfactuals \
+        --hf_config religion \
         --out_dir output_lvlm_gen \
         --model Qwen/Qwen2.5-VL-7B-Instruct \
         --batch_size 8 --num_responses 3 \
@@ -113,7 +136,7 @@ done
 wait
 ```
 
-Each partition writes a separate JSONL named `<prefix>_<partition>.jsonl`, where `<prefix>` encodes the metadata file, model, prompts, and any flags.
+Each partition writes a separate JSONL named `<prefix>_<partition>.jsonl`, where `<prefix>` encodes either the Hugging Face dataset id and config (HF mode) or the metadata file name (local mode), plus the model, prompts, and any flags.
 
 ## 2. Merge partition outputs (`concatenate_lvlm_outputs.py`)
 

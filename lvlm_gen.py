@@ -1,11 +1,12 @@
 """Generate text from Large Vision-Language Models on the Cultural
 Counterfactuals dataset.
 
-Loads a counterfactual-set metadata file, iterates over the corresponding
-images (or, optionally, just the source person images, or a blank image for
-text-only baselines), prompts a chosen LVLM with one or more questions, and
-appends the responses to a JSONL output file. The script can be partitioned
-across multiple invocations for parallel execution.
+Loads a counterfactual-set metadata file (or the published Hugging Face
+dataset), iterates over the corresponding images (or, optionally, just the
+source person images, or a blank image for text-only baselines), prompts a
+chosen LVLM with one or more questions, and appends the responses to a
+JSONL output file. The script can be partitioned across multiple invocations
+for parallel execution.
 """
 
 import argparse
@@ -72,8 +73,10 @@ def parse_arguments():
     parser.add_argument(
         "--ctf_dir",
         type=str,
+        default=None,
         help="Directory containing the counterfactual images "
-             "(parent of the per-counterfactual-set subdirectories).",
+             "(parent of the per-counterfactual-set subdirectories). "
+             "Required for local mode; ignored when --hf_dataset is set.",
     )
     parser.add_argument(
         "--out_dir",
@@ -83,7 +86,30 @@ def parse_arguments():
     parser.add_argument(
         "--metadata",
         type=str,
-        help="Path to the post-filtering metadata JSON file.",
+        default=None,
+        help="Path to the post-filtering metadata JSON file. "
+             "Required for local mode; ignored when --hf_dataset is set.",
+    )
+    parser.add_argument(
+        "--hf_dataset",
+        type=str,
+        default=None,
+        help="Hugging Face dataset id (e.g. 'thoughtworks/CulturalCounterfactuals'). "
+             "When set, images are loaded from the published Parquet shards instead of "
+             "from --ctf_dir/--metadata.",
+    )
+    parser.add_argument(
+        "--hf_config",
+        type=str,
+        default=None,
+        help="Config name within --hf_dataset (one of 'religion', 'nationality', "
+             "'socioeconomic').",
+    )
+    parser.add_argument(
+        "--hf_split",
+        type=str,
+        default="train",
+        help="Split name within --hf_dataset.",
     )
     parser.add_argument(
         "--model",
@@ -159,12 +185,12 @@ def process_batch_molmo(
 ) -> Dict[str, torch.Tensor]:
     """
     Process in batch.
-    
+
     Args:
         processor: The original processor.
         texts: List of text inputs
         images_list: List of lists containing PIL images.
-        
+
     Returns:
         Dict with padded input_ids, images, image_input_idx, image_masks.
     """
@@ -267,6 +293,10 @@ def generate_qwen2_5_vl(img, prompt):
     """Generate a batch of responses with the Qwen2.5-VL model."""
     messages = [[
         {
+            "role": "system",
+            "content": [{"type": "text", "text": "You are a helpful assistant."}],
+        },
+        {
             "role": "user",
             "content": [
                 {"type": "image", "image": img[i]},
@@ -360,22 +390,51 @@ if __name__ == '__main__':
     args = parse_arguments()
     print(args)
 
-    with open(args.metadata, 'r') as f:
-        metadata = json.load(f)
-    metadata = np.array_split(metadata, args.n_partitions)[args.partition].tolist()
+    use_hf = bool(args.hf_dataset)
+    hf_ds = None
+    ctf_to_rows = None
+    if use_hf:
+        if not args.hf_config:
+            sys.exit("--hf_config is required when --hf_dataset is set.")
+        if args.people_only:
+            sys.exit(
+                "--people_only is not supported with --hf_dataset; the source person "
+                "images are not part of the published dataset."
+            )
+        from datasets import load_dataset
+        print(f"Loading {args.hf_dataset} (config={args.hf_config}, split={args.hf_split})...")
+        hf_ds = load_dataset(args.hf_dataset, args.hf_config, split=args.hf_split)
+        ctf_sets_col = hf_ds["ctf_set"]
+        file_names_col = hf_ds["file_name"]
+        unique_ctf_sets = sorted(set(ctf_sets_col))
+        unique_ctf_sets = np.array_split(unique_ctf_sets, args.n_partitions)[args.partition].tolist()
+        partition_set = set(unique_ctf_sets)
+        ctf_to_rows = {c: [] for c in unique_ctf_sets}
+        for idx, c in enumerate(ctf_sets_col):
+            if c in partition_set:
+                ctf_to_rows[c].append((idx, file_names_col[idx]))
+        metadata = [{"ctf_set": c} for c in unique_ctf_sets]
+    else:
+        if not args.metadata:
+            sys.exit("--metadata is required when --hf_dataset is not set.")
+        if not args.ctf_dir and not (args.people_only or args.text_only):
+            sys.exit("--ctf_dir is required when --hf_dataset is not set.")
+        with open(args.metadata, 'r') as f:
+            metadata = json.load(f)
+        metadata = np.array_split(metadata, args.n_partitions)[args.partition].tolist()
 
     if os.path.exists(args.prompts):
         prompts_set = pd.read_csv(args.prompts)['prompt'].to_list()
     else:
         prompts_set = [prompts[p] for p in args.prompts.split(',')]
-    
+
     if args.prompt_prefix:
         prompts_set = [' '.join([args.prompt_prefix, i]).strip() for i in prompts_set]
 
     if 'llava-v1.6' in args.model:
         processor = LlavaNextProcessor.from_pretrained(
             args.model,
-            torch_dtype=torch.bfloat16, 
+            torch_dtype=torch.bfloat16,
             device_map="cuda"
         )
     else:
@@ -385,24 +444,24 @@ if __name__ == '__main__':
             torch_dtype=torch.bfloat16,
             device_map='cuda'
         )
-    
+
     if 'Qwen2.5-VL' in args.model:
         model = Qwen2_5_VLForConditionalGeneration.from_pretrained(
             args.model,
-            torch_dtype=torch.bfloat16, 
+            torch_dtype=torch.bfloat16,
             device_map="cuda"
         ).eval()
         processor.tokenizer.padding_side = "left"
     elif 'gemma-3' in args.model:
         model = Gemma3ForConditionalGeneration.from_pretrained(
             args.model,
-            torch_dtype=torch.bfloat16, 
+            torch_dtype=torch.bfloat16,
             device_map="cuda"
         ).eval()
     elif 'llava-v1.6' in args.model:
         model = LlavaNextForConditionalGeneration.from_pretrained(
             args.model,
-            torch_dtype=torch.bfloat16, 
+            torch_dtype=torch.bfloat16,
             device_map="cuda",
             low_cpu_mem_usage=True
         ).eval()
@@ -420,7 +479,10 @@ if __name__ == '__main__':
             device_map='cuda'
         ).eval()
 
-    prefix = args.metadata.split('/')[-1].replace('.json','')
+    if use_hf:
+        prefix = f"{args.hf_dataset.replace('/', '__')}-{args.hf_config}"
+    else:
+        prefix = args.metadata.split('/')[-1].replace('.json','')
     if args.people_only:
         prefix += '-no-context'
     if args.text_only:
@@ -428,8 +490,8 @@ if __name__ == '__main__':
     if args.prompt_prefix:
         prefix += '-' + '-'.join(args.prompt_prefix.lower().replace('.','').split())
     file_id = '_'.join([prefix,
-                        args.model.split('/')[-1], 
-                        args.prompts.replace(',','-').split('/')[-1].replace('.csv',''), 
+                        args.model.split('/')[-1],
+                        args.prompts.replace(',','-').split('/')[-1].replace('.csv',''),
                         str(args.partition)])
     out_file = os.path.join(args.out_dir, file_id + '.jsonl')
     Path(os.path.dirname(out_file)).mkdir(parents=True, exist_ok=True)
@@ -492,11 +554,32 @@ if __name__ == '__main__':
             else:
                 metadata_subset = metadata
             for i in metadata_subset:
-                img_dir = os.path.join(args.ctf_dir, i['ctf_set'])
-                files = [f for f in os.listdir(img_dir) if f.endswith('.png') and 'stitched_image' not in f]
-                for f in files:
-                    img_file_path = os.path.join(img_dir, f)
-                    img = Image.open(img_file_path)
+                if use_hf:
+                    file_iter = [
+                        (fname, row_idx)
+                        for row_idx, fname in ctf_to_rows[i['ctf_set']]
+                        if fname.endswith('.png') and 'stitched_image' not in fname
+                    ]
+                else:
+                    img_dir = os.path.join(args.ctf_dir, i['ctf_set'])
+                    file_iter = [
+                        (f, None)
+                        for f in os.listdir(img_dir)
+                        if f.endswith('.png') and 'stitched_image' not in f
+                    ]
+                for fname, row_idx in file_iter:
+                    if use_hf:
+                        basename = fname.rsplit('/', 1)[-1]
+                        img_file_path = (
+                            f"hf://{args.hf_dataset}/{args.hf_config}/"
+                            f"{i['ctf_set']}/{basename}"
+                        )
+                        # Defer Arrow row-fetch + BytesIO materialization to the
+                        # generation loop; store just the row index here.
+                        img = row_idx
+                    else:
+                        img_file_path = os.path.join(args.ctf_dir, i['ctf_set'], fname)
+                        img = Image.open(img_file_path)
                     for _ in range(args.num_responses):
                         index+=1
                         if index < skip:
@@ -511,27 +594,31 @@ if __name__ == '__main__':
                             batch_prompt.append([prompt])
                             batch_img_file.append([img_file_path])
                             b+=1
-    
+
     if len(batch_img[0]) == 0:
         sys.exit()
     print('Beginning generation')
     for b in tqdm(range(len(batch_img))):
+        if use_hf:
+            imgs_b = [hf_ds[idx]['image'] for idx in batch_img[b]]
+        else:
+            imgs_b = batch_img[b]
         if 'gemma-3' in args.model or 'InternVL3-' in args.model:
-            generated_text = generate(batch_img[b], batch_prompt[b])
+            generated_text = generate(imgs_b, batch_prompt[b])
         elif 'Molmo-7B' in args.model:
-            generated_text = generate_molmo(batch_img[b], batch_prompt[b])
+            generated_text = generate_molmo(imgs_b, batch_prompt[b])
         elif 'Qwen2.5-VL' in args.model:
-            generated_text = generate_qwen2_5_vl(batch_img[b], batch_prompt[b])
+            generated_text = generate_qwen2_5_vl(imgs_b, batch_prompt[b])
         elif 'llava-v1.6' in args.model:
-            generated_text = generate_llava1_6(batch_img[b], batch_prompt[b])
+            generated_text = generate_llava1_6(imgs_b, batch_prompt[b])
         else:
             raise NotImplementedError
 
         for i in range(len(generated_text)):
-            out_dict = { 'model' : args.model, 
+            out_dict = { 'model' : args.model,
                         'img_file_path' : batch_img_file[b][i],
-                        'args' : vars(args), 
-                        'prompt' : batch_prompt[b][i], 
+                        'args' : vars(args),
+                        'prompt' : batch_prompt[b][i],
                         'text' : generated_text[i]}
             with open(out_file, 'a') as f:
                 json.dump(out_dict, f)
